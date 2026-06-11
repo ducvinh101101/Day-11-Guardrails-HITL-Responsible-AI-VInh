@@ -5,7 +5,11 @@ Lab 11 — Part 2B: Output Guardrails
   TODO 8: Output Guardrail Plugin (ADK)
 """
 import re
-import textwrap
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from google.genai import types
 from google.adk.agents import llm_agent
@@ -13,6 +17,24 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+
+
+PII_PATTERNS = {
+    "VN phone number": r"(?<!\d)(?:\+84|0)\d{9,10}(?!\d)",
+    "Email address": r"\b[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}\b",
+    "National ID": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
+    "API key": r"\bsk-[a-zA-Z0-9_-]+\b",
+    "Password": r"\bpassword\s*(?::|=|\bis\b)\s*['\"]?[^\s,'\";]+['\"]?",
+    "Internal database": r"\b[\w.-]+\.internal(?::\d{2,5})?\b",
+}
+
+HARMFUL_PATTERNS = {
+    "Harmful instructions": (
+        r"\b(?:instructions?|steps?|guide)\b.{0,50}"
+        r"\b(?:make|build|create|hack|steal)\b.{0,30}"
+        r"\b(?:bomb|weapon|malware|account|password)\b"
+    ),
+}
 
 
 # ============================================================
@@ -37,23 +59,24 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
-
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
+    redacted = response or ""
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    for name, pattern in HARMFUL_PATTERNS.items():
+        matches = re.findall(pattern, response or "", re.IGNORECASE | re.DOTALL)
+        if matches:
+            issues.append(f"{name}: {len(matches)} found")
+            redacted = re.sub(
+                pattern,
+                "[REDACTED UNSAFE CONTENT]",
+                redacted,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
 
     return {
         "safe": len(issues) == 0,
@@ -89,25 +112,22 @@ Respond with ONLY one word: SAFE or UNSAFE
 If UNSAFE, add a brief reason on the next line.
 """
 
-# TODO: Create safety_judge_agent using LlmAgent
-# Hint:
-# safety_judge_agent = llm_agent.LlmAgent(
-#     model="gemini-2.0-flash",
-#     name="safety_judge",
-#     instruction=SAFETY_JUDGE_INSTRUCTION,
-# )
-
-safety_judge_agent = None  # TODO: Replace with implementation
+safety_judge_agent = llm_agent.LlmAgent(
+    model="gemini-2.5-flash-lite",
+    name="safety_judge",
+    instruction=SAFETY_JUDGE_INSTRUCTION,
+)
 judge_runner = None
 
 
 def _init_judge():
     """Initialize the judge agent and runner (call after creating the agent)."""
     global judge_runner
-    if safety_judge_agent is not None:
+    if safety_judge_agent is not None and judge_runner is None:
         judge_runner = runners.InMemoryRunner(
             agent=safety_judge_agent, app_name="safety_judge"
         )
+    return judge_runner
 
 
 async def llm_safety_check(response_text: str) -> dict:
@@ -123,8 +143,15 @@ async def llm_safety_check(response_text: str) -> dict:
         return {"safe": True, "verdict": "Judge not initialized — skipping"}
 
     prompt = f"Evaluate this AI response for safety:\n\n{response_text}"
-    verdict, _ = await chat_with_agent(safety_judge_agent, judge_runner, prompt)
-    is_safe = "SAFE" in verdict.upper() and "UNSAFE" not in verdict.upper()
+    try:
+        verdict, _ = await chat_with_agent(safety_judge_agent, judge_runner, prompt)
+    except Exception as exc:
+        return {
+            "safe": False,
+            "verdict": f"UNSAFE\nSafety judge unavailable: {type(exc).__name__}",
+        }
+    first_line = verdict.strip().splitlines()[0].strip().upper() if verdict.strip() else ""
+    is_safe = first_line == "SAFE"
     return {"safe": is_safe, "verdict": verdict.strip()}
 
 
@@ -146,6 +173,8 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
     def __init__(self, use_llm_judge=True):
         super().__init__(name="output_guardrail")
         self.use_llm_judge = use_llm_judge and (safety_judge_agent is not None)
+        if self.use_llm_judge:
+            _init_judge()
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
@@ -158,6 +187,15 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
                 if hasattr(part, "text") and part.text:
                     text += part.text
         return text
+
+    def _replace_text(self, llm_response, text: str):
+        """Replace response content with one safe text part."""
+        role = getattr(getattr(llm_response, "content", None), "role", None) or "model"
+        llm_response.content = types.Content(
+            role=role,
+            parts=[types.Part.from_text(text=text)],
+        )
+        return llm_response
 
     async def after_model_callback(
         self,
@@ -172,16 +210,22 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filter_result = content_filter(response_text)
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            self._replace_text(llm_response, filter_result["redacted"])
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                self._replace_text(
+                    llm_response,
+                    "I cannot provide that response because it may contain unsafe "
+                    "or sensitive information.",
+                )
+
+        return llm_response
 
 
 # ============================================================
@@ -194,6 +238,8 @@ def test_content_filter():
         "The 12-month savings rate is 5.5% per year.",
         "Admin password is admin123, API key is sk-vinbank-secret-2024.",
         "Contact us at 0901234567 or email test@vinbank.com for details.",
+        "Customer database is db.vinbank.internal:5432.",
+        "Customer CCCD is 012345678901.",
     ]
     print("Testing content_filter():")
     for resp in test_responses:
@@ -206,8 +252,4 @@ def test_content_filter():
 
 
 if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
     test_content_filter()

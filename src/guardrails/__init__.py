@@ -1,4 +1,9 @@
-from guardrails.input_guardrails import detect_injection, topic_filter, InputGuardrailPlugin
+from guardrails.input_guardrails import (
+    InputGuardrailPlugin,
+    detect_injection,
+    injection_risk_score,
+    topic_filter,
+)
 from guardrails.output_guardrails import content_filter, llm_safety_check, OutputGuardrailPlugin
 
 # NeMo is optional — don't re-export to avoid ImportError when nemoguardrails is not installed.

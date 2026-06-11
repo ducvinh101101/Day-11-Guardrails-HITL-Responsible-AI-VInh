@@ -1,1 +1,8 @@
-from attacks.attacks import adversarial_prompts, run_attacks, RED_TEAM_PROMPT, generate_ai_attacks
+from attacks.attacks import (
+    RED_TEAM_PROMPT,
+    advanced_adversarial_prompts,
+    adversarial_prompts,
+    all_attack_prompts,
+    generate_ai_attacks,
+    run_attacks,
+)
